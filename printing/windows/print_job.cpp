@@ -230,6 +230,17 @@ void PrintJob::sendLayout() {
       static_cast<double>(GetDeviceCaps(hDC, PHYSICALWIDTH)) / dpiX;
   auto pageHeight =
       static_cast<double>(GetDeviceCaps(hDC, PHYSICALHEIGHT)) / dpiY;
+  // A DC whose driver reports no device metrics returns 0 here: the page
+  // size would reach onLayout as NaN or infinity, and nothing could print.
+  if (!(dpiX > 0) || !(dpiY > 0) || !(pageWidth > 0) || !(pageHeight > 0)) {
+    // Released on the worker like the other failed jobs; Dart awaits
+    // onCompleted.
+    printing->runOnWorker([this] {
+      cancelJob("Unable to read the printer page size");
+      delete this;
+    });
+    return;
+  }
   auto printableWidth = static_cast<double>(GetDeviceCaps(hDC, HORZRES)) / dpiX;
   auto printableHeight =
       static_cast<double>(GetDeviceCaps(hDC, VERTRES)) / dpiY;
