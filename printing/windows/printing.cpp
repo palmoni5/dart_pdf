@@ -19,38 +19,102 @@
 #include <fpdfview.h>
 
 #include <mutex>
+#include <string>
+
+#include <delayimp.h>
 
 #include "print_job.h"
 
+// pdfium.dll is delay-loaded from the plugin's directory under a private name:
+// a pdfium.dll loaded by the application is a separate module and its global
+// state is not shared with this plugin.
+static FARPROC WINAPI loadPrivatePdfium(unsigned notify, PDelayLoadInfo info) {
+  if (notify != dliNotePreLoadLibrary || _stricmp(info->szDll, "pdfium.dll")) {
+    return nullptr;
+  }
+
+  HMODULE module = nullptr;
+  wchar_t path[MAX_PATH];
+  if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         reinterpret_cast<LPCWSTR>(&loadPrivatePdfium),
+                         &module) ||
+      !GetModuleFileName(module, path, MAX_PATH)) {
+    return nullptr;
+  }
+
+  auto file = std::wstring{path};
+  file = file.substr(0, file.find_last_of(L'\\') + 1) + L"pdfium_printing.dll";
+  return reinterpret_cast<FARPROC>(
+      LoadLibraryEx(file.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH));
+}
+
+extern "C" const PfnDliHook __pfnDliNotifyHook2 = loadPrivatePdfium;
+
 namespace nfet {
 
-// PDFium is a process-wide library: only the first instance initializes it and
-// only the last one destroys it.
+std::mutex Printing::pdfiumMutex;
+
+static const wchar_t kPlatformWindowClass[] = L"NfetPrintingPlatformWindow";
+
+// PDFium is a process-wide library: it is initialized on first use and
+// destroyed with the last instance, only if this plugin initialized it.
 static int libraryRefCount = 0;
+static bool libraryInitialized = false;
 static std::mutex libraryMutex;
 
 Printing::Printing(flutter::MethodChannel<flutter::EncodableValue>* channel,
                    flutter::PluginRegistrarWindows* registrar)
-    : channel{channel}, registrar{registrar} {
+    : channel{channel},
+      registrar{registrar},
+      platformThreadId{GetCurrentThreadId()} {
   const std::lock_guard<std::mutex> lock{libraryMutex};
-  if (libraryRefCount++ == 0) {
+  libraryRefCount++;
+}
+
+Printing::~Printing() {
+  if (worker.joinable()) {
+    {
+      const std::lock_guard<std::mutex> lock{workerMutex};
+      workerStopping = true;
+    }
+    workerCondition.notify_one();
+    // Lets queued jobs finish; their callbacks are dropped with the window.
+    worker.join();
+  }
+
+  if (platformWindow) {
+    DestroyWindow(platformWindow);
+  }
+
+  const std::lock_guard<std::mutex> lock{libraryMutex};
+  if (--libraryRefCount == 0 && libraryInitialized) {
+    FPDF_DestroyLibrary();
+    libraryInitialized = false;
+  }
+}
+
+void Printing::initLibrary() {
+  const std::lock_guard<std::mutex> lock{libraryMutex};
+  if (!libraryInitialized) {
     FPDF_LIBRARY_CONFIG config;
     config.version = 2;
     config.m_pUserFontPaths = nullptr;
     config.m_pIsolate = nullptr;
     config.m_v8EmbedderSlot = 0;
     FPDF_InitLibraryWithConfig(&config);
-  }
-}
-
-Printing::~Printing() {
-  const std::lock_guard<std::mutex> lock{libraryMutex};
-  if (--libraryRefCount == 0) {
-    FPDF_DestroyLibrary();
+    libraryInitialized = true;
   }
 }
 
 HWND Printing::getWindow() {
+  // With several Flutter views (multi-window apps) the registrar's view is
+  // only the first one, possibly hidden. Method calls arrive on the platform
+  // thread, which owns every view, so its active window is the one the user
+  // is printing from.
+  if (HWND active = GetActiveWindow()) {
+    return GetAncestor(active, GA_ROOT);
+  }
   auto* view = registrar->GetView();
   if (!view) {
     return nullptr;
@@ -59,22 +123,107 @@ HWND Printing::getWindow() {
   return hwnd ? GetAncestor(hwnd, GA_ROOT) : nullptr;
 }
 
+void Printing::runOnWorker(std::function<void()> task) {
+  if (!worker.joinable()) {
+    WNDCLASS windowClass{};
+    windowClass.lpfnWndProc = platformWindowProc;
+    windowClass.hInstance = GetModuleHandle(nullptr);
+    windowClass.lpszClassName = kPlatformWindowClass;
+    RegisterClass(&windowClass);  // Fails harmlessly if already registered.
+
+    platformWindow =
+        CreateWindow(kPlatformWindowClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE,
+                     nullptr, windowClass.hInstance, nullptr);
+    SetWindowLongPtr(platformWindow, GWLP_USERDATA,
+                     reinterpret_cast<LONG_PTR>(this));
+
+    worker = std::thread{&Printing::runWorker, this};
+  }
+
+  {
+    const std::lock_guard<std::mutex> lock{workerMutex};
+    workerTasks.push_back(std::move(task));
+  }
+  workerCondition.notify_one();
+}
+
+void Printing::runWorker() {
+  for (;;) {
+    std::function<void()> task;
+    {
+      std::unique_lock<std::mutex> lock{workerMutex};
+      workerCondition.wait(
+          lock, [this] { return workerStopping || !workerTasks.empty(); });
+      if (workerTasks.empty()) {
+        return;
+      }
+      task = std::move(workerTasks.front());
+      workerTasks.pop_front();
+    }
+    task();
+  }
+}
+
+void Printing::runOnPlatform(std::function<void()> task) {
+  if (GetCurrentThreadId() == platformThreadId) {
+    task();
+    return;
+  }
+
+  {
+    const std::lock_guard<std::mutex> lock{platformMutex};
+    platformTasks.push_back(std::move(task));
+  }
+  PostMessage(platformWindow, WM_APP, 0, 0);
+}
+
+void Printing::runPlatformTasks() {
+  std::deque<std::function<void()>> tasks;
+  {
+    const std::lock_guard<std::mutex> lock{platformMutex};
+    tasks.swap(platformTasks);
+  }
+  for (auto& task : tasks) {
+    task();
+  }
+}
+
+LRESULT CALLBACK Printing::platformWindowProc(HWND hwnd,
+                                              UINT message,
+                                              WPARAM wparam,
+                                              LPARAM lparam) {
+  if (message == WM_APP) {
+    auto printing =
+        reinterpret_cast<Printing*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+    if (printing) {
+      printing->runPlatformTasks();
+    }
+    return 0;
+  }
+  return DefWindowProc(hwnd, message, wparam, lparam);
+}
+
+void Printing::invokeMethod(const std::string& method,
+                            flutter::EncodableValue arguments) {
+  runOnPlatform([this, method, arguments = std::move(arguments)] {
+    channel->InvokeMethod(method,
+                          std::make_unique<flutter::EncodableValue>(arguments));
+  });
+}
+
 void Printing::onPageRasterized(std::vector<uint8_t> data,
                                 int width,
                                 int height,
                                 PrintJob* job) {
-  channel->InvokeMethod(
+  invokeMethod(
       "onPageRasterized",
-      std::make_unique<flutter::EncodableValue>(
-          flutter::EncodableValue(flutter::EncodableMap{
-              {flutter::EncodableValue("image"), flutter::EncodableValue(data)},
-              {flutter::EncodableValue("width"),
-               flutter::EncodableValue(width)},
-              {flutter::EncodableValue("height"),
-               flutter::EncodableValue(height)},
-              {flutter::EncodableValue("job"),
-               flutter::EncodableValue(job->id())},
-          })));
+      flutter::EncodableValue(flutter::EncodableMap{
+          {flutter::EncodableValue("image"),
+           flutter::EncodableValue(std::move(data))},
+          {flutter::EncodableValue("width"), flutter::EncodableValue(width)},
+          {flutter::EncodableValue("height"), flutter::EncodableValue(height)},
+          {flutter::EncodableValue("job"), flutter::EncodableValue(job->id())},
+      }));
 }
 
 void Printing::onPageRasterEnd(PrintJob* job, const std::string& error) {
@@ -86,33 +235,63 @@ void Printing::onPageRasterEnd(PrintJob* job, const std::string& error) {
     map[flutter::EncodableValue("error")] = flutter::EncodableValue(error);
   }
 
-  channel->InvokeMethod(
-      "onPageRasterEnd",
-      std::make_unique<flutter::EncodableValue>(flutter::EncodableValue(map)));
+  invokeMethod("onPageRasterEnd", flutter::EncodableValue(map));
 }
 
 class OnLayoutResult : public flutter::MethodResult<flutter::EncodableValue> {
  public:
-  OnLayoutResult(PrintJob* job) : job{job} {}
+  OnLayoutResult(Printing* printing, PrintJob* job)
+      : printing{printing}, job{job} {}
 
  private:
+  Printing* printing;
   PrintJob* job;
 
  protected:
   void SuccessInternal(const flutter::EncodableValue* result) {
     auto doc = std::get<std::vector<uint8_t>>(*result);
 
-    job->writeJob(doc);
-    delete job;
+    printing->runOnWorker([printing = printing, job = job,
+                           doc = std::move(doc)]() mutable {
+      auto extension = job->outputFileExtension();
+      if (extension.empty()) {
+        job->writeJob(std::move(doc));
+        delete job;
+        return;
+      }
+
+      // The driver would prompt from this thread with no owner window, and
+      // the dialog could open behind the app while it blocks the queue.
+      printing->runOnPlatform([printing, job, extension,
+                               doc = std::move(doc)]() mutable {
+        auto accepted = job->askOutputFile(extension);
+        printing->runOnWorker([job, accepted, doc = std::move(doc)]() mutable {
+          if (accepted) {
+            job->writeJob(std::move(doc));
+          } else {
+            job->cancelJob("");
+          }
+          delete job;
+        });
+      });
+    });
   }
 
   void ErrorInternal(const std::string& error_code,
                      const std::string& error_message,
                      const flutter::EncodableValue* error_details) {
-    delete job;
+    fail(error_message.empty() ? error_code : error_message);
   }
 
-  void NotImplementedInternal() { delete job; }
+  void NotImplementedInternal() { fail("onLayout is not implemented"); }
+
+  // Released on the worker like the other job paths; Dart awaits onCompleted.
+  void fail(const std::string& error) {
+    printing->runOnWorker([job = job, error]() {
+      job->cancelJob(error);
+      delete job;
+    });
+  }
 };
 
 void Printing::onLayout(PrintJob* job,
@@ -140,7 +319,7 @@ void Printing::onLayout(PrintJob* job,
                                 {flutter::EncodableValue("marginBottom"),
                                  flutter::EncodableValue(marginBottom)},
                             })),
-                        std::make_unique<OnLayoutResult>(job));
+                        std::make_unique<OnLayoutResult>(this, job));
 }
 
 // send completion status to flutter
@@ -157,9 +336,7 @@ void Printing::onCompleted(PrintJob* job,
     map[flutter::EncodableValue("error")] = flutter::EncodableValue(error);
   }
 
-  channel->InvokeMethod(
-      "onCompleted",
-      std::make_unique<flutter::EncodableValue>(flutter::EncodableValue(map)));
+  invokeMethod("onCompleted", flutter::EncodableValue(map));
 }
 
 }  // namespace nfet

@@ -1,0 +1,146 @@
+name: Linux raster worker
+
+on:
+  pull_request:
+    paths:
+      - 'printing/linux/**'
+      - 'printing/example/integration_test/linux*.dart'
+      - 'printing/example/pubspec.yaml'
+      - '.github/workflows/linux-raster-worker.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Multiple commits can arrive while shared organization runners are busy.
+# Only the latest SHA needs its expensive Linux matrix.
+concurrency:
+  group: printing-linux-pdfium-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-raster:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            channel: stable
+          - runner: ubuntu-24.04-arm
+            # Stable ARM64 discovery is currently broken in flutter-action;
+            # the repository's existing ARM job uses master artifacts too.
+            channel: master
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ matrix.channel }}
+      - name: Enable Linux desktop
+        run: flutter config --enable-linux-desktop
+      - name: Install Linux build and display dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang cmake ninja-build pkg-config libgtk-3-dev xvfb binutils
+      - name: Test native worker ownership and GTK callback dispatch
+        run: |
+          read -ra glib_flags <<< "$(pkg-config --cflags --libs glib-2.0)"
+          c++ -std=c++17 -Wall -Wextra -Werror \
+            printing/linux/test/raster_dispatch_test.cc \
+            "${glib_flags[@]}" -o "$RUNNER_TEMP/raster-dispatch-test"
+          "$RUNNER_TEMP/raster-dispatch-test"
+      - name: Prepare example platform files
+        working-directory: printing/example
+        run: flutter create -t app --no-overwrite --org net.nfet --project-name example .
+      - name: Prefetch pinned PDFium through the GitHub API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch="${{ runner.arch }}"
+          case "$arch" in
+            X64) asset='pdfium-linux-x64.tgz' ;;
+            ARM64) asset='pdfium-linux-arm64.tgz' ;;
+            *) echo "::error::unsupported runner arch $arch"; exit 2 ;;
+          esac
+          release_url='https://api.github.com/repos/bblanchon/pdfium-binaries/releases/tags/chromium%2F5200'
+          release_json="$(curl --fail --location --retry 8 --retry-all-errors --retry-delay 3 \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "$release_url")"
+          asset_url="$(jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .url' <<<"$release_json")"
+          test -n "$asset_url" && test "$asset_url" != null
+          mkdir -p "$RUNNER_TEMP/pdfium"
+          curl --fail --location --retry 8 --retry-all-errors --retry-delay 3 --max-time 300 \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/octet-stream' \
+            "$asset_url" -o "$RUNNER_TEMP/pdfium.tgz"
+          tar -xzf "$RUNNER_TEMP/pdfium.tgz" -C "$RUNNER_TEMP/pdfium"
+          test -f "$RUNNER_TEMP/pdfium/PDFiumConfig.cmake"
+          echo "PRINTING_PDFIUM_DIR=$RUNNER_TEMP/pdfium" >> "$GITHUB_ENV"
+
+      # The real app also loads pdfium_dart's Chromium/8125 in the main
+      # namespace. Test it concurrently with printing's Chromium/5200 rather
+      # than validating just an isolated 5200 raster.
+      - name: Prefetch public PDFium 8125 for coexistence stress
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.arch }}" in
+            X64) asset='pdfium-linux-x64.tgz' ;;
+            ARM64) asset='pdfium-linux-arm64.tgz' ;;
+            *) exit 2 ;;
+          esac
+          release_url='https://api.github.com/repos/bblanchon/pdfium-binaries/releases/tags/chromium%2F8125'
+          release_json="$(curl --fail --location --retry 8 --retry-all-errors --retry-delay 3 \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "$release_url")"
+          asset_url="$(jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .url' <<<"$release_json")"
+          test -n "$asset_url" && test "$asset_url" != null
+          mkdir -p "$RUNNER_TEMP/public-pdfium"
+          curl --fail --location --retry 8 --retry-all-errors --retry-delay 3 --max-time 300 \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/octet-stream' \
+            "$asset_url" -o "$RUNNER_TEMP/public-pdfium.tgz"
+          tar -xzf "$RUNNER_TEMP/public-pdfium.tgz" -C "$RUNNER_TEMP/public-pdfium"
+          test -f "$RUNNER_TEMP/public-pdfium/lib/libpdfium.so"
+          echo "PRINTING_PUBLIC_PDFIUM=$RUNNER_TEMP/public-pdfium/lib/libpdfium.so" >> "$GITHUB_ENV"
+
+      - name: Build Linux example
+        working-directory: printing/example
+        run: flutter build linux
+      - name: Audit actual Linux ELF and printing bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          plugin="$(find printing/example/build/linux -path '*/release/bundle/lib/libprinting_plugin.so' -print -quit)"
+          test -n "$plugin"
+          bundle_lib="$(dirname "$plugin")"
+          private="$bundle_lib/libpdfium_printing.so"
+          test -f "$private"
+          cmp "$private" "$PRINTING_PDFIUM_DIR/lib/libpdfium.so"
+          test ! -f "$bundle_lib/libpdfium.so"
+          readelf -d "$plugin" | tee "$RUNNER_TEMP/printing-dynamic.txt"
+          if readelf -d "$plugin" | grep -E 'NEEDED.*(libpdfium|libpdfium_printing)' ; then
+            echo "::error::printing plugin must not link any PDFium library"
+            exit 1
+          fi
+          if nm -D "$plugin" | grep -E ' U (FPDF|FPDFBitmap)' ; then
+            echo "::error::printing plugin has unresolved global PDFium symbols"
+            exit 1
+          fi
+          echo "Printing private bytes: $(stat -c %s "$private")"
+          echo "Public pdfrx bytes: $(stat -c %s "$PRINTING_PUBLIC_PDFIUM")"
+          sha256sum "$private" "$PRINTING_PUBLIC_PDFIUM"
+
+      - name: Run native raster and cross-version coexistence integration tests
+        working-directory: printing/example
+        run: xvfb-run -a flutter test integration_test/linux_raster_worker_test.dart -d linux
+      # A separate Flutter process must exercise the reverse loading order:
+      # initialize 8125 first, then dynamically load printing 5200.
+      - name: Test public-before-private PDFium load order
+        working-directory: printing/example
+        run: |
+          xvfb-run -a flutter test integration_test/linux_raster_worker_test.dart -d linux \
+            --plain-name 'PDFium 8125 remains live through isolated printing 5200 jobs'

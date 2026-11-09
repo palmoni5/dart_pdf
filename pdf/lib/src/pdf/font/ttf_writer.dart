@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'ttf_parser.dart';
@@ -87,8 +86,8 @@ class TtfWriter {
     // Create the glyphs table
     final glyphsMap = <int, TtfGlyphInfo>{};
     final charMap = <int, int>{};
-    final overflow = <int>{};
     final compounds = <int, int>{};
+    final visited = <int>{};
 
     for (final char in chars) {
       if (char == 32) {
@@ -111,13 +110,21 @@ class TtfWriter {
         continue;
       }
 
-      void addGlyph(glyphIndex) {
+      void addGlyph(int glyphIndex) {
+        // Marked before the components are visited, so shared or cyclic
+        // references are decoded once and cannot recurse forever.
+        if (!visited.add(glyphIndex)) {
+          return;
+        }
+        if (glyphIndex < 0 || glyphIndex >= ttf.glyphOffsets.length) {
+          throw FormatException('Compound glyph index $glyphIndex is invalid');
+        }
         final glyph = ttf.readGlyph(glyphIndex).copy();
         for (final g in glyph.compounds) {
           compounds[g] = -1;
-          overflow.add(g);
           addGlyph(g);
         }
+        // Components first: this order decides the subset glyph ids.
         glyphsMap[glyph.index] = glyph;
       }
 
@@ -126,41 +133,34 @@ class TtfWriter {
     }
 
     final glyphsInfo = <TtfGlyphInfo>[];
+    final usedGlyphs = <int>{};
 
     for (final char in chars) {
       final glyphsIndex = charMap[char];
       if (glyphsIndex != null) {
-        final glyph = glyphsMap[glyphsIndex];
-        if (glyph != null) {
-          glyphsInfo.add(glyph);
-        } else if (glyphsMap.isNotEmpty) {
-          glyphsInfo.add(glyphsMap.values.first);
-        } else {
-          // The font has no glyph reachable for [char] AND every other glyph in the
-          // subset has already been consumed, so `glyphsMap.values.first` would throw
-          // `Bad state: No element`. Surface a clearer diagnostic that names the
-          // offending codepoint — this is typically a font/charset mismatch
-          // (e.g. Arabic Presentation Forms in a font with no Presentation glyphs).
-          throw Exception(
-            "Missing glyph for character '${String.fromCharCode(char)}' "
-            '(U+${char.toRadixString(16).toUpperCase().padLeft(4, '0')}) '
-            'in font ${ttf.fontName}. Use a font that includes this codepoint, '
-            'or strip/normalize the character before passing it to the PDF.',
-          );
-        }
-        glyphsMap.remove(glyphsIndex);
+        final glyph = glyphsMap[glyphsIndex]!;
+        // Every char gets its own slot, even when it shares a glyph id; a copy
+        // keeps compound indices from being remapped twice.
+        glyphsInfo.add(usedGlyphs.add(glyphsIndex) ? glyph : glyph.copy());
       }
     }
 
-    glyphsInfo.addAll(glyphsMap.values);
+    glyphsInfo.addAll(
+      glyphsMap.values.where((glyph) => !usedGlyphs.contains(glyph.index)),
+    );
 
-    // Add compound glyphs
+    // Build an original-GID -> subset-GID index once; a linear search for
+    // every compound component scales quadratically on complex fonts.
+    final subsetIndices = <int, int>{};
+    for (var index = 0; index < glyphsInfo.length; index++) {
+      subsetIndices.putIfAbsent(glyphsInfo[index].index, () => index);
+    }
     for (final compound in compounds.keys) {
-      final index = glyphsInfo.firstWhere(
-        (TtfGlyphInfo glyph) => glyph.index == compound,
-      );
-      compounds[compound] = glyphsInfo.indexOf(index);
-      assert((compounds[compound] ?? 0) >= 0, 'Unable to find the glyph');
+      final index = subsetIndices[compound];
+      if (index == null) {
+        throw FormatException('Missing compound glyph $compound in subset');
+      }
+      compounds[compound] = index;
     }
 
     // update compound indices
@@ -332,13 +332,17 @@ class TtfWriter {
       final start = ByteData(12 + numTables * 16);
       start.setUint32(0, 0x00010000);
       start.setUint16(4, numTables);
-      var pot = numTables;
-      while (pot & (pot - 1) != 0) {
-        pot++;
+      // sfnt uses the largest power of two <= numTables, not the next one.
+      var searchPower = 1;
+      var entrySelector = 0;
+      while (searchPower * 2 <= numTables) {
+        searchPower *= 2;
+        entrySelector++;
       }
-      start.setUint16(6, pot * 16);
-      start.setUint16(8, math.log(pot).toInt());
-      start.setUint16(10, pot * 16 - numTables * 16);
+      final searchRange = searchPower * 16;
+      start.setUint16(6, searchRange);
+      start.setUint16(8, entrySelector);
+      start.setUint16(10, numTables * 16 - searchRange);
 
       // Create the table directory
       var count = 0;

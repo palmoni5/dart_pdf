@@ -1,5 +1,11 @@
 # Changelog
 
+## 5.15.2
+
+- Fix `PdfRaster.toPng()` leaking the temporary `dart:ui` image it creates for each PNG encode
+- Share one in-flight download between simultaneous `PdfMemoryCache.resolve` calls for the same asset, and look the cache up once instead of `contains` then `get`
+- Fix `PdfPreview` dropping a page format change or refresh requested while a slow build or raster was running
+
 ## 5.15.1
 
 - Fix iOS use-after-free crash in `CGPDFDocumentGetNumberOfPages`: UIKit reads the PDF document from a background page-count thread while dynamic layout replaces it on the main thread; document access is now lock-guarded
@@ -12,6 +18,16 @@
 - Fix Windows and Linux callbacks being routed to the wrong isolate with multiple `FlutterEngine`s (multi-window): the method channel is now owned by the plugin instance instead of a global
 - Fix PDFium being destroyed on Windows while another plugin instance is still using it: the library is now reference counted on Windows and Linux
 - Fix the Windows print dialog not being owned by the window that started the job with multiple windows
+- Initialize PDFium on Windows on first use instead of at plugin registration, and destroy it only if the plugin initialized it
+- Add the `PRINTING_PDFIUM_DIR` CMake option on Windows to use an existing PDFium build instead of downloading one
+- Fix the Windows build bundling a `pdfium.dll` found on `PATH` instead of the one it compiles against
+- Fix Windows printing, `listPrinters` and `raster` blocking the UI thread: they now run on a dedicated print thread that serializes PDFium calls
+- Fix `directPrintPdf` on Windows never completing when the printer cannot be opened
+- Fix a Windows crash in `directPrintPdf` when the printer driver cannot be queried: the `DC_EXTRA` error value `-1` was used as the size of the driver data
+- Fix the Windows file dialog of print-to-file printers (Microsoft Print to PDF, XPS Document Writer, `FILE:` port) opening without an owner window, possibly behind the app: the file name is now asked in a dialog owned by the app window, and cancelling it or a failing `StartDoc` completes the job
+- Load PDFium on Windows from a private `pdfium_printing.dll` next to the plugin, so it no longer shares its non-thread-safe global state with another `pdfium.dll` loaded by the application
+- Fix `layoutPdf` and `directPrintPdf` never completing on Linux when the `onLayout` callback throws: the job is now cancelled and completes with the error, as on Android, iOS and macOS
+- Fix Windows printing to a printer whose driver reports no device metrics: the page size reached `onLayout` as NaN or infinity; the job now completes with an error instead
 
 ## 5.15.0
 

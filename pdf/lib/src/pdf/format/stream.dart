@@ -24,13 +24,19 @@ class PdfStream {
   int _offset = 0;
 
   void _ensureCapacity(int size) {
-    if (_stream.length - _offset >= size) {
+    final requiredCapacity = _offset + size;
+    if (requiredCapacity <= _stream.length) {
       return;
     }
 
-    final newSize = _offset + size + _grow;
+    // Grow geometrically: repeatedly appending to a long PDF must not copy
+    // all previously written bytes for every 64 KiB of new content.
+    var newSize = _stream.length;
+    while (newSize < requiredCapacity) {
+      newSize *= 2;
+    }
     final newBuffer = Uint8List(newSize);
-    newBuffer.setAll(0, _stream);
+    newBuffer.setRange(0, _offset, _stream);
     _stream = newBuffer;
   }
 
@@ -50,7 +56,9 @@ class PdfStream {
   }
 
   void putStream(PdfStream s) {
-    putBytes(s._stream);
+    // The backing buffer includes unused capacity, which is not PDF content.
+    // A view also avoids allocating an intermediate copy for this append.
+    putBytes(Uint8List.sublistView(s._stream, 0, s._offset));
   }
 
   int get offset => _offset;
